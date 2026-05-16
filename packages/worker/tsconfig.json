@@ -19,8 +19,15 @@
 		"module": "es2022",
 		"noEmit": true,
 		/* If your code runs in the DOM: */
-		"lib": ["es2022"],
-		"types": ["@types/node", "@cloudflare/workers-types/experimental"]
+		"lib": [
+			"es2022"
+		],
+		"types": [
+			"@types/node",
+			"@cloudflare/workers-types/experimental"
+		]
 	},
-	"include": ["src"]
+	"include": [
+		"src"
+	]
 }
