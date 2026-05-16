@@ -4,10 +4,22 @@ import type { Context } from "hono";
 export type BasicAuthType = {
 	username: string;
 	password: string;
+	groups?: string[];
 };
 
 export type BucketConfig = {
 	publicUrl?: string;
+};
+
+export type PermissionRule = {
+	groups?: string[];
+	users?: string[];
+	prefixes?: string[];
+};
+
+export type BucketPermission = {
+	read?: PermissionRule[];
+	write?: PermissionRule[];
 };
 
 export type R2ExplorerConfig = {
@@ -17,15 +29,13 @@ export type R2ExplorerConfig = {
 	dashboardUrl?: string;
 	emailRouting?:
 		| {
-				targetBucket: string;
-		  }
+			targetBucket: string;
+		}
 		| false;
 	showHiddenFiles?: boolean;
 	basicAuth?: BasicAuth | BasicAuth[];
 	buckets?: Record<string, BucketConfig>;
-};
-
-export type ShareMetadata = {
+	bucketPermissions?: Record<string, BucketPermission>;
 	bucket: string;
 	key: string;
 	expiresAt?: number;

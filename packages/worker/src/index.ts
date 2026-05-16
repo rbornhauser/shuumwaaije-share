@@ -35,8 +35,95 @@ import type {
 	AppEnv,
 	AppVariables,
 	BasicAuthType,
+	BucketPermission,
 	R2ExplorerConfig,
 } from "./types";
+
+type PermissionAction = "read" | "write";
+
+function decodeR2Base64Key(value?: string) {
+	if (!value) return "";
+	try {
+		return decodeURIComponent(escape(atob(value)));
+	} catch {
+		return value;
+	}
+}
+
+function getUserGroups(c: AppContext) {
+	const basicAuth = c.get("config").basicAuth;
+	if (!basicAuth) return [];
+
+	const users = Array.isArray(basicAuth) ? basicAuth : [basicAuth];
+	const username = c.get("authentication_username");
+	return users.find((user) => user.username === username)?.groups ?? [];
+}
+
+function matchesPermissionRule(
+	rule: { groups?: string[]; users?: string[]; prefixes?: string[] },
+	username: string | undefined,
+	groups: string[],
+	path: string,
+) {
+	const isUserMatch = username && rule.users?.includes(username);
+	const isGroupMatch = groups.some((group) => rule.groups?.includes(group));
+	if (!isUserMatch && !isGroupMatch) return false;
+
+	if (!rule.prefixes || rule.prefixes.length === 0) return true;
+	if (path === "") {
+		return rule.prefixes.some((prefix) => prefix === "" || prefix === "/");
+	}
+	return rule.prefixes.some((prefix) => path === prefix || path.startsWith(prefix));
+}
+
+async function getRequestedPath(c: AppContext) {
+	const bucketKey = c.req.param("key");
+	if (bucketKey) return decodeR2Base64Key(bucketKey);
+
+	const url = new URL(c.req.url);
+	const prefix = url.searchParams.get("prefix");
+	if (prefix) return decodeR2Base64Key(prefix);
+
+	const queryKey = url.searchParams.get("key");
+	if (queryKey) return decodeR2Base64Key(queryKey);
+
+	const contentType = c.req.header("content-type")?.split(";")[0];
+	if (contentType === "application/json") {
+		const body = await c.req.json().catch(() => null);
+		if (body) {
+			return (
+				decodeR2Base64Key(body.key) ||
+				decodeR2Base64Key(body.oldKey) ||
+				decodeR2Base64Key(body.sourceKey) ||
+				decodeR2Base64Key(body.destinationKey) ||
+				""
+			);
+		}
+	}
+
+	return "";
+}
+
+async function isBucketAllowed(
+	c: AppContext,
+	bucketName: string,
+	action: PermissionAction,
+) {
+	const bucketPermissions = c.get("config").bucketPermissions;
+	if (!bucketPermissions) return true;
+
+	const bucketRule = bucketPermissions[bucketName] as BucketPermission | undefined;
+	if (!bucketRule) return false;
+
+	const rules = bucketRule[action];
+	if (!rules || rules.length === 0) return false;
+
+	const username = c.get("authentication_username");
+	const groups = getUserGroups(c);
+	const path = await getRequestedPath(c);
+
+	return rules.some((rule) => matchesPermissionRule(rule, username, groups, path));
+}
 
 export function R2Explorer(config?: R2ExplorerConfig) {
 	extendZodWithOpenApi(z);
@@ -79,44 +166,81 @@ export function R2Explorer(config?: R2ExplorerConfig) {
 		app.use("/api/*", readOnlyMiddleware);
 	}
 
-	if (config.cfAccessTeamName) {
-		app.use("/api/*", cloudflareAccess(config.cfAccessTeamName));
-		app.use("/api/*", async (c, next) => {
-			c.set("authentication_type", "cloudflare-access");
-			c.set("authentication_username", c.get("accessPayload").email);
+	const cloudflareAccessMiddleware = config.cfAccessTeamName
+		? cloudflareAccess(config.cfAccessTeamName)
+		: undefined;
+
+	const basicAuthMiddleware = config.basicAuth
+		? basicAuth({
+			invalidUserMessage: "Authentication error: Basic Auth required",
+			verifyUser: (username, password, c: AppContext) => {
+				const users = (
+					Array.isArray(c.get("config").basicAuth)
+						? c.get("config").basicAuth
+						: [c.get("config").basicAuth]
+				) as BasicAuthType[];
+
+				for (const user of users) {
+					if (user.username === username && user.password === password) {
+						c.set("authentication_type", "basic-auth");
+						c.set("authentication_username", username);
+						return true;
+					}
+				}
+
+				return false;
+			},
+		})
+		: undefined;
+
+	if (config.cfAccessTeamName || config.basicAuth) {
+		if (config.basicAuth) {
+			openapi.registry.registerComponent("securitySchemes", "basicAuth", {
+				type: "http",
+				scheme: "basic",
+			});
+		}
+
+		app.use("*", async (c, next) => {
+			if (c.req.path.startsWith("/share")) {
+				return next();
+			}
+
+			if (cloudflareAccessMiddleware) {
+				await cloudflareAccessMiddleware(c, async () => {
+					c.set("authentication_type", "cloudflare-access");
+					c.set("authentication_username", c.get("accessPayload").email);
+					await next();
+				});
+				return;
+			}
+
+			if (basicAuthMiddleware) {
+				return basicAuthMiddleware(c, next);
+			}
+
 			await next();
 		});
 	}
 
-	if (config.basicAuth) {
-		openapi.registry.registerComponent("securitySchemes", "basicAuth", {
-			type: "http",
-			scheme: "basic",
-		});
-		app.use(
-			"/api/*",
-			basicAuth({
-				invalidUserMessage: "Authentication error: Basic Auth required",
-				verifyUser: (username, password, c: AppContext) => {
-					const users = (
-						Array.isArray(c.get("config").basicAuth)
-							? c.get("config").basicAuth
-							: [c.get("config").basicAuth]
-					) as BasicAuthType[];
+	const bucketAccessMiddleware = async (c: AppContext, next: () => Promise<void>) => {
+		const bucketName = c.req.param("bucket");
+		if (!bucketName) {
+			return next();
+		}
 
-					for (const user of users) {
-						if (user.username === username && user.password === password) {
-							c.set("authentication_type", "basic-auth");
-							c.set("authentication_username", username);
-							return true;
-						}
-					}
+		const action: PermissionAction =
+			c.req.method === "GET" || c.req.method === "HEAD" ? "read" : "write";
 
-					return false;
-				},
-			}),
-		);
-	}
+		if (!(await isBucketAllowed(c, bucketName, action))) {
+			return c.text("Forbidden", { status: 403 });
+		}
+
+		return next();
+	};
+
+	app.use("/api/buckets/:bucket", bucketAccessMiddleware);
+	app.use("/api/buckets/:bucket/*", bucketAccessMiddleware);
 
 	openapi.get("/api/server/config", GetInfo);
 
